@@ -1,56 +1,150 @@
-# Project6-WordPress
-# Project 6: Three-Tier WordPress Web Solution with LVM Storage Infrastructure
+Markdown
+# Project 6: Three-Tier Web Solution with WordPress and LVM Storage Management
 
-This repository contains the complete documentation and deployment files for **Project 6: Web Solution with WordPress**, demonstrating a highly available, decoupled architecture utilizing a **Three-Tier Architecture pattern** on Red Hat Enterprise Linux (RHEL) EC2 instances
-
----
-
-## 🏗️ System Architecture Overview
-
-The project showcases a classic production-ready design split into three distinct management layers:
-1. **Presentation Layer (PL):** Client laptop/browser accessing the application via HTTP Port 80
-2. **Business/Application Layer (BL):** Apache (HTTPD) and PHP-FPM running on a dedicated Web Server instance (`172.31.43.63`)
-3. **Data Access Layer (DAL):** A remote MySQL Database server (`172.31.35.138`) managing relational storage
+This repository documents the successful implementation of a scalable, resilient **Three-Tier Web Architecture** hosting a WordPress website connected to a remote MySQL database. The infrastructure is built on AWS EC2 instances running Red Hat Enterprise Linux (RHEL), utilizing Advanced Linux Storage Management via **Logical Volume Manager (LVM)**.
 
 ---
 
-## 🛠️ Step 1: Storage Subsystem & LVM Configuration (Web Server)
+## Architecture Overview
 
-To establish dynamic storage bounds and isolate logical failures, three 10 GiB Amazon EBS volumes were mounted and pooled using Logical Volume Management (LVM2)[cite: 25, 42, 77].
+The project implements a classic **Three-Tier Architecture**:
+1. **Presentation Layer (Client):** A web browser on a laptop/PC.
+2. **Business Logic Layer (Web Server):** An AWS EC2 RHEL instance running Apache HTTP Server, PHP, and WordPress.
+3. **Data Management Layer (Database Server):** An AWS EC2 RHEL instance running MySQL Server.
 
-### 1. Disk Partitioning
-Raw NVMe devices (`/dev/nvme1n1`, `/dev/nvme2n1`, and `/dev/nvme3n1`) were partitioned via `fdisk`, initializing a modern GPT table and assigning the modern Linux LVM identifier 
+---
+
+## Part 1: Storage Infrastructure & LVM Configuration (Web Server)
+
+### 1. Inspecting Attached Block Devices
+Three 10 GiB Elastic Block Store (EBS) volumes were attached to the Red Hat EC2 instance. The devices were inspected using `lsblk`:
+
 ```bash
-sudo fdisk /dev/nvme1n1
-# Interactive sequence used: g ➔ n ➔ Enter ➔ Enter ➔ Enter ➔ t ➔ 30 ➔ w
-2. LVM Volume Creation & Safe Log MigrationBash# Create Physical Volumes
+lsblk
+Output:
+
+Plaintext
+NAME        MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+nvme2n1     259:0    0   10G  0 disk
+nvme0n1     259:1    0   10G  0 disk
+├─nvme0n1p1 259:3    0    1M  0 part
+├─nvme0n1p2 259:4    0  200M  0 part /boot/efi
+└─nvme0n1p3 259:5    0  9.8G  0 part /
+nvme1n1     259:2    0   10G  0 disk
+nvme3n1     259:6    0   10G  0 disk
+Engineering Note: The newly attached 10 GB storage drives were recognized by the OS kernel as nvme1n1, nvme2n1, and nvme3n1.
+
+2. Overcoming the RHEL Subscription Trap
+Problem Solving: Since the un-registered RHEL instance lacked access to standard subscription repositories where gdisk resides, fdisk was utilized instead. fdisk comes pre-installed and natively supports creating GPT partition tables and setting modern LVM hex codes (30 for Linux LVM).
+
+The partitioning sequence executed for each disk (nvme1n1, nvme2n1, nvme3n1) using sudo fdisk /dev/<device>:
+
+g (Create a new empty GPT partition table)
+
+n (Create new partition)
+
+Defaults accepted for partition number, first sector, and last sector
+
+t (Change partition type)
+
+30 (Hex code for Linux LVM in modern fdisk GPT mode)
+
+w (Write changes and exit)
+
+3. Creating Physical Volumes (PVs) and Volume Group (VG)
+The newly created LVM partitions were marked as Physical Volumes and pooled together into a single, cohesive storage pool named webdata-vg:
+
+Bash
 sudo pvcreate /dev/nvme1n1p1 /dev/nvme2n1p1 /dev/nvme3n1p1
-
-# Pool into a Volume Group
 sudo vgcreate webdata-vg /dev/nvme1n1p1 /dev/nvme2n1p1 /dev/nvme3n1p1
+Verification of the storage pool using sudo vgs confirmed a total pooled space of approximately 30 GB.
 
-# Allocate Logical Volumes
+4. Allocating Logical Volumes (LVs)
+The pooled space was carved out into two dedicated Logical Volumes:
+
+apps-lv: Allocated 14 GB to store the WordPress web files.
+
+logs-lv: Allocated the remaining free space for system and application logging.
+
+Bash
 sudo lvcreate -L 14G -n apps-lv webdata-vg
 sudo lvcreate -l 100%FREE -n logs-lv webdata-vg
-⚠️ Critical Step Avoidance of Data Loss: Pre-existing system logs inside /var/log were safely synchronized to a recovery buffer before mounting the new block device to avoid breaking core OS monitoring hooks.  Bashsudo mkdir -p /var/www/html /home/recovery/logs
+5. Formatting, Mounting, and Log Data Preservation
+The logical blocks were formatted using the ext4 filesystem:
+
+Bash
+sudo mkfs -t ext4 /dev/webdata-vg/apps-lv
+sudo mkfs -t ext4 /dev/webdata-vg/logs-lv
+Crucial Log Backup Step
+To prevent losing existing system log data during initial volume mounting over /var/log, rsync was leveraged to safeguard the data:
+
+Bash
+sudo mkdir -p /var/www/html
+sudo mkdir -p /home/recovery/logs
+
+# Backup existing logs
 sudo rsync -av /var/log/ /home/recovery/logs/
+
+# Mount the fresh logical volumes
 sudo mount /dev/webdata-vg/apps-lv /var/www/html/
 sudo mount /dev/webdata-vg/logs-lv /var/log
+
+# Restore log files into the newly mounted storage
 sudo rsync -av /home/recovery/logs/ /var/log/
-3. FSTAB Persistence RegistryBlock UUID identifiers (blkid) were harvested to ensure that the partition table persists gracefully across infrastructure restarts.  Plaintext# Configuration appended to /etc/fstab
-UUID=your-apps-lv-uuid  /var/www/html  ext4  defaults  0  0
-UUID=your-logs-lv-uuid  /var/log       ext4  defaults  0  0
-Verify setup layout with df -h and lsblk.  🗄️ Step 2: Remote Database Infrastructure ProvisioningThe storage provisioning sequence was mirrored on the second RHEL instance (DB Server), creating a dedicated logical volume db-lv mapped to the database data directory /db.  1. MySQL Server Engine SetupBashsudo yum update -y
+6. Establishing Storage Persistence (/etc/fstab)
+To guarantee that mounts persist across system reboots, unique block identifiers (UUIDs) were obtained via sudo blkid. The entries were safely appended to /etc/fstab:
+
+Plaintext
+UUID=11111111-2222-3333-4444-555555555555  /var/www/html  ext4  defaults  0  0
+UUID=abcdefab-cdef-abcd-efab-cdefabcdefab  /var/log       ext4  defaults  0  0
+The setup was tested and reloaded with sudo mount -a and sudo systemctl daemon-reload to verify syntactic stability.
+
+Part 2: Database Server Storage Deployment
+A second RHEL EC2 instance was launched to act as the dedicated Database Tier. The LVM lifecycle steps were mirrored exactly, but instead of mapping an app directory, the data-centric logical volume (db-lv) was safely mounted to the /db directory to host the database engines.
+
+Part 3: Application Installation and Database Integration
+1. Web Layer Configuration (Apache & PHP)
+On the Web Server, package mirrors were updated, and the Apache Web Server along with modern PHP 7.4 runtimes (via Remi repositories) were deployed to satisfy WordPress technical requirements:
+
+Bash
+sudo yum -y update
+sudo yum install [https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm](https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm)
+sudo yum install yum-utils [http://rpms.remirepo.net/enterprise/remi-release-8.rpms](http://rpms.remirepo.net/enterprise/remi-release-8.rpms)
+sudo yum module reset php && sudo yum module enable php:remi-7.4
+sudo yum install wget httpd php php-opcache php-gd php-curl php-mysqlnd php-fpm php-json -y
+sudo systemctl enable --now httpd php-fpm
+2. WordPress Deployment & Security Remediation (SELinux)
+The latest WordPress binary distribution package was fetched, extracted, and placed directly in the web root. Crucially, native Linux kernel access controls were preserved by configuring explicit SELinux policies to allow Apache to safely write data files and communicate over the network:
+
+Bash
+# Configure ownership and SELinux context
+sudo chown -R apache:apache /var/www/html/wordpress
+sudo chcon -t httpd_sys_rw_content_t /var/www/html/wordpress -R
+sudo setsebool -P httpd_can_network_connect=1
+3. Database Layer Setup (MySQL)
+On the isolated Database Server, MySQL Server was installed and initialized:
+
+Bash
 sudo yum install mysql-server -y
 sudo systemctl enable --now mysqld
-2. Relational Schema Blueprint & Target Security BoundsSQLCREATE DATABASE wordpress;
--- Security Hardening: Restricting authentication strictly to the Web Server internal IP
-CREATE USER 'myuser'@'172.31.43.63' IDENTIFIED BY '********';
-GRANT ALL PRIVILEGES ON wordpress.* TO 'myuser'@'172.31.43.63';
+A dedicated database instance was created, and explicit permission grants were restricted strictly to the Web Server's internal private IP block for enhanced backend protection:
+
+SQL
+CREATE DATABASE wordpress;
+CREATE USER 'myuser'@'<Web-Server-Private-IP-Address>' IDENTIFIED BY 'mypass';
+GRANT ALL ON wordpress.* TO 'myuser'@'<Web-Server-Private-IP-Address>';
 FLUSH PRIVILEGES;
-📝 Step 3: Comprehensive Deployment Error Log & ResolutionsDuring deployment, a series of complex infrastructural errors were encountered and systematically resolved:🚨 Case 1: Read-Only File System ErrorSymptom: Execution scripts returned sed: couldn't open temporary file: Read-only file system.Root Cause: The underlying AWS storage block layer tripped into protective safety mode due to early disk resource saturation or allocation lockouts.Resolution: Performed a hardware reset/reboot cycle via the EC2 console dashboard to trigger automated background check arrays (fsck) to restore read-write capability (rw).🚨 Case 2: Continuous 504 Gateway Timeout ErrorsSymptom: The public browser endpoint hung indefinitely before printing a Gateway Timeout loop. Apache logged error code AH01075: Error dispatching request to : (polling).Root Cause 1 (Password Parsing Loop): The initial database password contained a trailing $ character (113355pasS$). The underlying PHP compiler interpreted this special character as an unset environment variable pointer, throwing an infinite parsing loop.Root Cause 2 (Apache to PHP-FPM Disconnect): PHP-FPM was bound natively to a local file stream socket (/run/php-fpm/www.sock), while Apache was searching over a TCP network boundary (127.0.0.1:9000).Resolution: 1. Updated the password inside MySQL and wp-config.php to a web-safe, policy-compliant format: '********'.2. Modified the handler definition inside Apache's PHP proxy interface configuration /etc/httpd/conf.d/php.conf:Apache<FilesMatch \.php$>
-    SetHandler "proxy:unix:/run/php-fpm/www.sock|fcgi://localhost"
-</FilesMatch>
-Aligned file permissions across the communication socket: sudo chown apache:apache /run/php-fpm/www.sock.🚨 Case 3: Error Establishing a Database ConnectionSymptom: The gateway loop resolved, but the app dropped instantly into a database validation block.Root Cause: A tiny single-digit typo existed in the database host config string (173.31.35.138), routing queries outside the internal AWS ecosystem.Resolution: Corrected the line item in /var/www/html/wp-config.php to target the accurate internal network path without extra ports:PHPdefine( 'DB_HOST', '172.31.35.138' );
-📸 Step-by-Step Step-by-Step Implementation ProgressAll active confirmation verification checkpoints have been packaged and hyperlinked from our core directory repository tree:1. Storage Infrastructure LayoutVisual verification displaying LVM allocation trees and ext4 mapping registries.2. Remote Client Validation HandshakeManual MySQL terminal proxy authentication connection test verification.3. Production Launch ScreenLive capture displaying the accessible WordPress deployment environment.(Note: Full set of step images are zipped inside the asset bundle file project6_images.zip in this root folder).🚀 Recommended Verification Steps Before Project SubmissionBefore submitting the solution files to your technical reviewer, execute these final operational assertions on your instances to verify complete structural compliance:  Verify Live Status Rules: Confirm Apache and PHP-FPM engine layers are stable on the web host:Bashsudo systemctl status httpd php-fpm
-Verify Security Group Isolation Constraints: Ensure port 3306 on your Database instance strictly utilizes a /32 CIDR limit bounded solely to your Web Server's Private IP for optimal surface exposure reduction.  Validate Persistence Routines: Execute sudo mount -a to guarantee that your /etc/fstab configuration file possesses completely clean syntax parameters to avoid startup system stalls on boot.  Clean Active Session Cache Elements: When validating in a web browser, consistently maintain an active Incognito session to bypass local cookie storage locks.
+Part 4: Frontend Verification & Successful Installation
+With TCP port 80 opened on the Web Server's Security Group and port 3306 opened on the DB Server's Security Group, the setup wizard was accessed through a web browser.
+
+Phase 1: Localization Selection
+The web configuration routine successfully parsed PHP code, presenting the language initialization selector screen:
+
+Phase 2: Administrative Provisioning
+Administrative account metadata, including site heading variables (amar project 6 Devop) and security credentials, were mapped into the application layer:
+
+Phase 3: Successful Deployment Database Handshake
+The database configuration files successfully performed the internal connection sequence over the private network subnet:
+
+Phase 4: Full Administration Control Panel
+The installation concluded with full access to the backend admin dashboard, operating on the distributed LVM infrastructure:
